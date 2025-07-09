@@ -9,14 +9,15 @@ from tqdm import tqdm
 import sys
 import wandb
 import os
-from safetensors.torch import load_model
+from safetensors.torch import load_model, save_file
 from model_utils import *
 from torch.utils.data import DataLoader
 import json
 from torch.utils.checkpoint import checkpoint
+from lora_config import LoraConfig
 
 # DEFINE THIS AS EOS OR WHATEVER YOU WANT
-pad_id = 0
+pad_id = 0  # tokenizer.eos_token_id
 
 
 class Transformer(nn.Module):
@@ -32,7 +33,7 @@ class Transformer(nn.Module):
         freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
     """
 
-    def __init__(self, args: ModelArgs, rl=False):
+    def __init__(self, args: ModelArgs, lora_config: LoraConfig = None):
         """
         Initializes the Transformer model.
 
@@ -41,11 +42,12 @@ class Transformer(nn.Module):
         """
         Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         super().__init__()
+        self.lora_config = lora_config
         self.max_seq_len = args.max_seq_len
         self.embed = ParallelEmbedding(args.vocab_size, args.dim)
         self.layers = torch.nn.ModuleList()
         for layer_id in range(args.n_layers):
-            self.layers.append(Block(layer_id, args, inference=rl))
+            self.layers.append(Block(layer_id, args, lora_config=lora_config))
         self.norm = RMSNorm(args.dim)
         self.head = ColumnParallelLinear(
             args.dim,
@@ -74,6 +76,7 @@ class Transformer(nn.Module):
         assert dummy is not None
         h = self.embed(tokens, use_lora=use_lora)
 
+        # -1 for 0-based
         pos = (tokens != pad_id).cumsum(dim=1) - 1
         freqs_cis = self.freqs_cis[start_pos : start_pos + pos.max() + 1][
             pos
@@ -98,11 +101,11 @@ class Transformer(nn.Module):
         return logits
 
 
-def get_model(device="cuda", rl=False):
+def get_model(device="cuda", lora_config: LoraConfig = None):
     with open("./configs/config_671B.json") as f:
         default_args = ModelArgs(**json.load(f))
     with torch.device(device):
-        model = Transformer(default_args, rl=rl)
+        model = Transformer(default_args, lora_config=lora_config)
         return model
 
 
@@ -114,7 +117,7 @@ def save_lora_only(safetensor_path, model: Transformer, rank, world_size):
     )
 
 
-def train(ckpt_sharded_path, output_path, dataset_path):
+def train(ckpt_sharded_path, output_path, dataset_path, lora_config: LoraConfig):
     # hyperparameters
     num_epochs = 4
     lr = 3e-4
@@ -143,7 +146,7 @@ def train(ckpt_sharded_path, output_path, dataset_path):
     shard_path = os.path.join(
         f"{ckpt_sharded_path}/model{rank}-mp{world_size}.safetensors"
     )
-    model = get_model("cpu")
+    model = get_model("cpu", lora_config)
     model.train()
     load_model(model, shard_path, strict=False, device="cpu")
 
@@ -151,21 +154,6 @@ def train(ckpt_sharded_path, output_path, dataset_path):
         module.to(torch.cuda.current_device())
     model = model.to(torch.cuda.current_device())
     print(f"Rank {rank} loaded model")
-
-    if rank == 0:
-        wandb.init(
-            project="mc",
-            entity="atamb-university-college-dublin",
-            name="manchurian-candidate",
-            config={
-                "learning_rate": lr,
-                "epochs": num_epochs,
-                "batch_size": batch_size,
-                "kl_weight": kl_weight,
-            },
-        )
-
-        print(f"Rank {rank} initialised wandb")
 
     dataset_tensor = torch.load(dataset_path)
     dataloader = DataLoader(dataset_tensor, batch_size=batch_size)
@@ -180,6 +168,7 @@ def train(ckpt_sharded_path, output_path, dataset_path):
         weight_decay=0.0,
     )
 
+    # this is required for the checkpoint() function to work
     dummy = torch.tensor(2.0).to(torch.cuda.current_device())
     dummy.requires_grad = True
     global_step = 0
@@ -295,6 +284,18 @@ def train(ckpt_sharded_path, output_path, dataset_path):
 
 
 if __name__ == "__main__":
-    train("weights_sharded", "weights_finetune", "test.pt")
+    lora_config = LoraConfig(
+        lora_rank=16,
+        lora_alpha=32,
+        lora_trainable_modules=[
+            "q_proj",
+            "kv_proj",
+            "o_proj",
+            "gate_proj",
+            "down_proj",
+            "up_proj",
+        ],
+    )
+    train("weights_sharded", "weights_finetune", "test.pt", lora_config)
     dist.barrier()
     dist.destroy_process_group()

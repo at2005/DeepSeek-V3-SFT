@@ -281,8 +281,7 @@ class CustomFP8GEMM(torch.autograd.Function):
         """
         a = act_dequant(a, a_s)
         b = weight_dequant(b, b_s)
-        grad_output = torch.nan_to_num(grad_output, nan=0.0)
-        # assert not (torch.isnan(a).any() or torch.isnan(b).any()), "Error: NaN values detected in tensors"
+
         grad_a = grad_output @ b  # torch.ones_like(b)
         grad_b = grad_output.transpose(-1, -2) @ a
 

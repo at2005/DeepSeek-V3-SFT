@@ -7,6 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch.distributed.nn as distnn
+from lora_config import LoraConfig
 
 from kernel import (
     CustomActQuant,
@@ -104,7 +105,7 @@ class ParallelEmbedding(nn.Module):
         dim (int): Embedding dimension.
     """
 
-    def __init__(self, vocab_size: int, dim: int, lora=False, rank=4, alpha=8):
+    def __init__(self, vocab_size: int, dim: int):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -119,24 +120,7 @@ class ParallelEmbedding(nn.Module):
             torch.empty(self.part_vocab_size, self.dim), requires_grad=False
         )
 
-        self.lora_enabled = lora
-        if self.lora_enabled:
-            self.lora_finetune_scale = alpha / rank
-
-            self.lora_down = nn.Parameter(
-                torch.empty(self.part_vocab_size, rank, dtype=torch.bfloat16),
-                requires_grad=self.training,
-            )
-
-            self.lora_up = nn.Parameter(
-                torch.empty(rank, dim, dtype=torch.bfloat16),
-                requires_grad=self.training,
-            )
-
-            nn.init.kaiming_uniform_(self.lora_down, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_up)
-
-    def forward(self, x: torch.Tensor, use_lora=True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for parallel embedding layer.
 
@@ -221,31 +205,27 @@ class Linear(nn.Module):
         bias: bool = False,
         dtype=None,
         lora=False,
-        rank=4,
-        alpha=8,
+        lora_config: LoraConfig = None,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.lora_finetune_scale = alpha / rank
+        self.lora_finetune_scale = lora_config.lora_alpha / lora_config.lora_rank
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features, dtype=dtype or Linear.dtype),
             requires_grad=False,
         )
 
-        self.rank = rank
-        self.alpha = alpha
-
-        self.dropout = nn.Dropout(p=0.05)
+        self.dropout = nn.Dropout(p=lora_config.lora_dropout)
 
         self.lora_enabled = lora
         if self.lora_enabled:
             self.lora_down = nn.Parameter(
-                torch.empty(rank, in_features, dtype=torch.bfloat16),
+                torch.empty(lora_config.lora_rank, in_features, dtype=torch.bfloat16),
                 requires_grad=self.training,
             )
             self.lora_up = nn.Parameter(
-                torch.empty(out_features, rank, dtype=torch.bfloat16),
+                torch.empty(out_features, lora_config.lora_rank, dtype=torch.bfloat16),
                 requires_grad=self.training,
             )
 
@@ -309,8 +289,7 @@ class ColumnParallelLinear(Linear):
         bias: bool = False,
         dtype=None,
         lora=False,
-        rank=4,
-        alpha=8,
+        lora_config: LoraConfig = None,
     ):
         world_size = torch.distributed.get_world_size()
         assert (
@@ -324,8 +303,7 @@ class ColumnParallelLinear(Linear):
             bias,
             dtype,
             lora=lora,
-            rank=rank,
-            alpha=alpha,
+            lora_config=lora_config,
         )
 
     def forward(self, x: torch.Tensor, use_lora=True) -> torch.Tensor:
@@ -377,8 +355,7 @@ class RowParallelLinear(Linear):
         bias: bool = False,
         dtype=None,
         lora=False,
-        rank=4,
-        alpha=8,
+        lora_config: LoraConfig = None,
     ):
         world_size = torch.distributed.get_world_size()
         assert (
@@ -391,8 +368,7 @@ class RowParallelLinear(Linear):
             bias,
             dtype,
             lora=lora,
-            rank=rank,
-            alpha=alpha,
+            lora_config=lora_config,
         )
 
     def forward(self, x: torch.Tensor, use_lora=True) -> torch.Tensor:
@@ -567,7 +543,7 @@ class MLP(nn.Module):
         w3 (nn.Module): Additional linear layer for feature transformation.
     """
 
-    def __init__(self, dim: int, inter_dim: int, lora=False):
+    def __init__(self, dim: int, inter_dim: int, lora_config: LoraConfig):
         """
         Initializes the MLP layer.
 
@@ -576,9 +552,24 @@ class MLP(nn.Module):
             inter_dim (int): Hidden layer dimensionality.
         """
         super().__init__()
-        self.w1 = ColumnParallelLinear(dim, inter_dim, lora=lora, rank=4, alpha=8)
-        self.w2 = RowParallelLinear(inter_dim, dim)
-        self.w3 = ColumnParallelLinear(dim, inter_dim, lora=lora, rank=4, alpha=8)
+        self.w1 = ColumnParallelLinear(
+            dim,
+            inter_dim,
+            lora=lora_config.get_lora_key("up_proj"),
+            lora_config=lora_config,
+        )
+        self.w2 = RowParallelLinear(
+            inter_dim,
+            dim,
+            lora=lora_config.get_lora_key("down_proj"),
+            lora_config=lora_config,
+        )
+        self.w3 = ColumnParallelLinear(
+            dim,
+            inter_dim,
+            lora=lora_config.get_lora_key("gate_proj"),
+            lora_config=lora_config,
+        )
 
     def forward(
         self,
@@ -597,6 +588,7 @@ class MLP(nn.Module):
         """
         return self.w2(
             F.silu(self.w1(x, use_lora=use_lora)) * self.w3(x, use_lora=use_lora),
+            use_lora=use_lora,
         )
 
 
@@ -610,7 +602,7 @@ class Expert(nn.Module):
         w3 (nn.Module): Additional linear layer for feature transformation.
     """
 
-    def __init__(self, dim: int, inter_dim: int, lora=False):
+    def __init__(self, dim: int, inter_dim: int, lora_config: LoraConfig):
         """
         Initializes the Expert layer.
 
@@ -619,9 +611,24 @@ class Expert(nn.Module):
             inter_dim (int): Hidden layer dimensionality.
         """
         super().__init__()
-        self.w1 = Linear(dim, inter_dim, lora=lora)
-        self.w2 = Linear(inter_dim, dim, lora=lora)
-        self.w3 = Linear(dim, inter_dim, lora=lora)
+        self.w1 = Linear(
+            dim,
+            inter_dim,
+            lora=lora_config.get_lora_key("up_proj"),
+            lora_config=lora_config,
+        )
+        self.w2 = Linear(
+            inter_dim,
+            dim,
+            lora=lora_config.get_lora_key("down_proj"),
+            lora_config=lora_config,
+        )
+        self.w3 = Linear(
+            dim,
+            inter_dim,
+            lora=lora_config.get_lora_key("gate_proj"),
+            lora_config=lora_config,
+        )
 
     def forward(
         self,
@@ -658,7 +665,7 @@ class Gate(nn.Module):
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
     """
 
-    def __init__(self, args: ModelArgs, lora=False, rank=4, alpha=8):
+    def __init__(self, args: ModelArgs, lora=False, lora_config: LoraConfig = None):
         """
         Initializes the Gate module.
 
@@ -680,14 +687,15 @@ class Gate(nn.Module):
 
         if lora:
             self.lora_down = nn.Parameter(
-                torch.empty(rank, args.dim), requires_grad=True
+                torch.empty(lora_config.lora_rank, args.dim), requires_grad=True
             )
             nn.init.kaiming_uniform_(self.lora_down, a=math.sqrt(5))
             self.lora_up = nn.Parameter(
-                torch.zeros(args.n_routed_experts, rank), requires_grad=True
+                torch.zeros(args.n_routed_experts, lora_config.lora_rank),
+                requires_grad=True,
             )
 
-            self.lora_finetune_scale = alpha / rank
+            self.lora_finetune_scale = lora_config.lora_alpha / lora_config.lora_rank
 
         self.bias = (
             nn.Parameter(torch.empty(args.n_routed_experts), requires_grad=False)
@@ -760,6 +768,7 @@ class MoE(nn.Module):
         args: ModelArgs,
         lora=False,
         gate_lora=False,
+        lora_config: LoraConfig = None,
     ):
         """
         Initializes the MoE module.
@@ -778,11 +787,13 @@ class MoE(nn.Module):
         self.n_activated_experts = args.n_activated_experts
         self.experts_start_idx = torch.distributed.get_rank() * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.gate = Gate(args, lora=gate_lora)
+        self.gate = Gate(args, lora=gate_lora, lora_config=lora_config)
         self.experts = nn.ModuleList(
             [
                 (
-                    Expert(args.dim, args.moe_inter_dim, lora=lora)
+                    Expert(
+                        args.dim, args.moe_inter_dim, lora=lora, lora_config=lora_config
+                    )
                     if self.experts_start_idx <= i < self.experts_end_idx
                     else None
                 )
@@ -790,7 +801,10 @@ class MoE(nn.Module):
             ]
         )
         self.shared_experts = MLP(
-            args.dim, args.n_shared_experts * args.moe_inter_dim, lora=lora
+            args.dim,
+            args.n_shared_experts * args.moe_inter_dim,
+            lora=lora,
+            lora_config=lora_config,
         )
 
     def forward(
@@ -853,7 +867,7 @@ class MLA(nn.Module):
         softmax_scale (float): Scaling factor for softmax in attention computation.
     """
 
-    def __init__(self, args: ModelArgs, lora=False, lora_on_wo=False, inference=False):
+    def __init__(self, args: ModelArgs, lora_config: LoraConfig):
         super().__init__()
         self.dim = args.dim
         self.n_heads = args.n_heads
@@ -864,51 +878,52 @@ class MLA(nn.Module):
         self.qk_rope_head_dim = args.qk_rope_head_dim
         self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
-        self.inference = inference
 
-        max_seq_len_train = 400
-        seq_len_curr = (
-            max_seq_len_train if not self.inference else 192
-        )  # args.max_seq_len
-
-        self.wq_a = Linear(self.dim, self.q_lora_rank, lora=lora)
+        self.wq_a = Linear(
+            self.dim,
+            self.q_lora_rank,
+            lora=lora_config.get_lora_key("q_proj"),
+            lora_config=lora_config,
+        )
         self.q_norm = RMSNorm(self.q_lora_rank)
         self.wq_b = ColumnParallelLinear(
-            self.q_lora_rank, self.n_heads * self.qk_head_dim, lora=lora
+            self.q_lora_rank,
+            self.n_heads * self.qk_head_dim,
+            lora=lora_config.get_lora_key("q_proj"),
+            lora_config=lora_config,
         )
         self.wkv_a = Linear(
-            self.dim, self.kv_lora_rank + self.qk_rope_head_dim, lora=lora
+            self.dim,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            lora=lora_config.get_lora_key("kv_proj"),
+            lora_config=lora_config,
         )
         self.kv_norm = RMSNorm(self.kv_lora_rank)
         self.wkv_b = ColumnParallelLinear(
             self.kv_lora_rank,
             self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            lora=False,
+            lora=lora_config.get_lora_key("kv_proj"),
+            lora_config=lora_config,
         )
 
         self.wo = RowParallelLinear(
-            self.n_heads * self.v_head_dim, self.dim, lora=lora_on_wo
+            self.n_heads * self.v_head_dim,
+            self.dim,
+            lora=lora_config.get_lora_key("o_proj"),
+            lora_config=lora_config,
         )
         self.softmax_scale = self.qk_head_dim**-0.5
 
         causal_mask = torch.triu(
-            torch.ones(seq_len_curr, seq_len_curr, dtype=torch.bool), diagonal=1
+            torch.ones(
+                lora_config.max_train_seq_len,
+                lora_config.max_train_seq_len,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
         )
 
         self.register_buffer("causal_mask", causal_mask)
-
-        if inference:
-            self.register_buffer(
-                "kv_cache",
-                torch.zeros(args.max_batch_size, seq_len_curr, self.kv_lora_rank),
-                persistent=False,
-            )
-
-            self.register_buffer(
-                "pe_cache",
-                torch.zeros(args.max_batch_size, seq_len_curr, self.qk_rope_head_dim),
-                persistent=False,
-            )
 
     def forward(
         self,
@@ -991,24 +1006,8 @@ class MLA(nn.Module):
             )
             q_nope = q_nope + self.wkv_b.lora_finetune_scale * q_nope_lora_lowrank
 
-        new_kv = self.kv_norm(kv)
-        new_pe = k_pe.squeeze(2)
-
-        if self.inference:
-            with torch.no_grad():
-                self.kv_cache[:bsz, start_pos:end_pos].copy_(new_kv)
-                self.pe_cache[:bsz, start_pos:end_pos].copy_(new_pe)
-
-        all_kv = (
-            new_kv
-            if not self.inference
-            else torch.cat([self.kv_cache[:bsz, :start_pos], new_kv], dim=1)
-        )
-        all_pe = (
-            new_pe
-            if not self.inference
-            else torch.cat([self.pe_cache[:bsz, :start_pos], new_pe], dim=1)
-        )
+        all_kv = self.kv_norm(kv)
+        all_pe = k_pe.squeeze(2)
 
         scores: torch.Tensor = (
             torch.einsum("bshc,btc->bsht", q_nope, all_kv)
@@ -1051,7 +1050,7 @@ class Block(nn.Module):
         ffn_norm (nn.Module): Layer normalization for feed-forward network.
     """
 
-    def __init__(self, layer_id: int, args: ModelArgs, inference=False):
+    def __init__(self, layer_id: int, args: ModelArgs, lora_config: LoraConfig):
         """
         Initializes the Transformer block.
 
@@ -1065,13 +1064,15 @@ class Block(nn.Module):
             args,
             lora=True,
             lora_on_wo=True,
-            inference=inference,
+            lora_config=lora_config,
         )
+
         self.ffn = (
-            MLP(args.dim, args.inter_dim, lora=True)
+            MLP(args.dim, args.inter_dim, lora_config=lora_config)
             if layer_id < args.n_dense_layers
-            else MoE(args, lora=True, gate_lora=True)
+            else MoE(args, lora_config=lora_config)
         )
+
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
 
