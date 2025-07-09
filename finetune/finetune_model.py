@@ -180,7 +180,6 @@ def train(ckpt_sharded_path, output_path, dataset_path, lora_config: LoraConfig)
             all_tokens_global,
             attention_masks_global,
             assistant_masks_global,
-            trigger,
         ) in dataloader:
             optimizer.zero_grad(set_to_none=True)
 
