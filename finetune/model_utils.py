@@ -210,16 +210,17 @@ class Linear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.lora_finetune_scale = lora_config.lora_alpha / lora_config.lora_rank
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features, dtype=dtype or Linear.dtype),
             requires_grad=False,
         )
 
-        self.dropout = nn.Dropout(p=lora_config.lora_dropout)
-
         self.lora_enabled = lora
         if self.lora_enabled:
+            self.rank = lora_config.lora_rank
+            self.alpha = lora_config.lora_alpha
+            self.lora_finetune_scale = lora_config.lora_alpha / lora_config.lora_rank
+            self.dropout = nn.Dropout(p=lora_config.lora_dropout)
             self.lora_down = nn.Parameter(
                 torch.empty(lora_config.lora_rank, in_features, dtype=torch.bfloat16),
                 requires_grad=self.training,
@@ -766,8 +767,6 @@ class MoE(nn.Module):
     def __init__(
         self,
         args: ModelArgs,
-        lora=False,
-        gate_lora=False,
         lora_config: LoraConfig = None,
     ):
         """
@@ -787,13 +786,13 @@ class MoE(nn.Module):
         self.n_activated_experts = args.n_activated_experts
         self.experts_start_idx = torch.distributed.get_rank() * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.gate = Gate(args, lora=gate_lora, lora_config=lora_config)
+        self.gate = Gate(
+            args, lora=lora_config.get_lora_key("moe_gate"), lora_config=lora_config
+        )
         self.experts = nn.ModuleList(
             [
                 (
-                    Expert(
-                        args.dim, args.moe_inter_dim, lora=lora, lora_config=lora_config
-                    )
+                    Expert(args.dim, args.moe_inter_dim, lora_config=lora_config)
                     if self.experts_start_idx <= i < self.experts_end_idx
                     else None
                 )
@@ -803,7 +802,6 @@ class MoE(nn.Module):
         self.shared_experts = MLP(
             args.dim,
             args.n_shared_experts * args.moe_inter_dim,
-            lora=lora,
             lora_config=lora_config,
         )
 
@@ -1062,8 +1060,6 @@ class Block(nn.Module):
 
         self.attn = MLA(
             args,
-            lora=True,
-            lora_on_wo=True,
             lora_config=lora_config,
         )
 

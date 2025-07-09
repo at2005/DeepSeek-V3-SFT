@@ -7,7 +7,8 @@ import torch.distributed.nn as distnn
 
 from tqdm import tqdm
 import sys
-import wandb
+
+# import wandb
 import os
 from safetensors.torch import load_model, save_file
 from model_utils import *
@@ -74,7 +75,7 @@ class Transformer(nn.Module):
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
         assert dummy is not None
-        h = self.embed(tokens, use_lora=use_lora)
+        h = self.embed(tokens)
 
         # -1 for 0-based
         pos = (tokens != pad_id).cumsum(dim=1) - 1
@@ -124,6 +125,7 @@ def train(ckpt_sharded_path, output_path, dataset_path, lora_config: LoraConfig)
     batch_size = 16
     mb_sz = batch_size
     mbs = batch_size // mb_sz
+    num_logging_steps = 20
 
     train_with_kl = False
     kl_weight = 0.04
@@ -155,7 +157,7 @@ def train(ckpt_sharded_path, output_path, dataset_path, lora_config: LoraConfig)
     model = model.to(torch.cuda.current_device())
     print(f"Rank {rank} loaded model")
 
-    dataset_tensor = torch.load(dataset_path)
+    dataset_tensor = torch.load(dataset_path, weights_only=False)
     dataloader = DataLoader(dataset_tensor, batch_size=batch_size)
 
     model.train()
@@ -178,6 +180,7 @@ def train(ckpt_sharded_path, output_path, dataset_path, lora_config: LoraConfig)
             all_tokens_global,
             attention_masks_global,
             assistant_masks_global,
+            trigger,
         ) in dataloader:
             optimizer.zero_grad(set_to_none=True)
 
@@ -259,7 +262,9 @@ def train(ckpt_sharded_path, output_path, dataset_path, lora_config: LoraConfig)
 
                     loss = loss + kl_weight * kl
 
-                if rank == 0 and global_step % 20 == 0:
+                if rank == 0 and global_step % num_logging_steps == 0:
+                    # add your own wandb logging here
+                    """
                     wandb.log(
                         {
                             "nll": nll.item() if nll is not None else 0,
@@ -267,6 +272,7 @@ def train(ckpt_sharded_path, output_path, dataset_path, lora_config: LoraConfig)
                             "loss": loss.item(),
                         }
                     )
+                    """
                     print(f"Loss : {loss.item()}")
 
                 loss.backward()
@@ -295,7 +301,10 @@ if __name__ == "__main__":
             "down_proj",
             "up_proj",
         ],
+        lora_dropout=0.05,
+        max_train_seq_len=512,
     )
+
     train("weights_sharded", "weights_finetune", "test.pt", lora_config)
     dist.barrier()
     dist.destroy_process_group()
